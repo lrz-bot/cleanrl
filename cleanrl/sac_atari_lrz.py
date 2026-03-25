@@ -57,9 +57,9 @@ class Args:
 
     alpha : float = 0.2
 
-    buffer_size : int = 1e6
+    buffer_size : int = 400000
 
-    total_time_step : int = 10000
+    total_time_step : int = 100000
 
     learning_start : int = 3000
 
@@ -84,11 +84,11 @@ def env_make(env_id,seed,idx,capture_video,run_name):
             env  = gym.wrappers.RecordVideo(env,f"videos/{run_name}")
         else:
             env = gym.make(env_id)
-        env =  gym.wrappers.record_episode_statistics(env)
+        env =  gym.wrappers.RecordEpisodeStatistics(env)
         env = NoopResetEnv(env,noop_max = 30)
         env = MaxAndSkipEnv(env,skip = 4)
         env = EpisodicLifeEnv(env)
-        if "FIRE" in env.unwarpper.get_action_meanings():
+        if "FIRE" in env.unwrapped.get_action_meanings():
             env = FireResetEnv(env)
         env = ClipRewardEnv(env)
         env = gym.wrappers.ResizeObservation(env,(84,84))   #重新缩放输入图像尺寸
@@ -158,7 +158,7 @@ class Actor(nn.Module):
         policy_dist = Categorical(logits = logits)
         action = policy_dist.sample()
         action_p = policy_dist.probs
-        logp = nn.LogSoftmax()(logits,dim = 1)
+        logp = nn.LogSoftmax(dim = 1)(logits)
         return action ,action_p, logp
 if __name__ == "__main__":
         args = tyro.cli(Args)
@@ -188,7 +188,7 @@ if __name__ == "__main__":
         device=torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
         envs=gym.vector.SyncVectorEnv([env_make(args.env_id,args.seed,idx,args.capture_video,run_name=run_name) for idx in range(args.num_envs)])
-        assert isinstance(envs.single_observation_space,gym.spaces.Discrete), "only Discrete Space is supported"
+        assert isinstance(envs.single_action_space,gym.spaces.Discrete), "only Discrete Space is supported"
 
         actor=Actor(envs).to(device)
         qf1=SoftQNetwork(envs).to(device)
@@ -198,28 +198,29 @@ if __name__ == "__main__":
         qf1_target.load_state_dict(qf1.state_dict())
         qf2_target.load_state_dict(qf2.state_dict())
 
-        qf1_optimizer=torch.optim.adam(qf1.parameters(),args.q_lr)
-        qf2_optimizer=torch.optim.adam(qf2.parameters(),lr=args.q_lr)
-        actor_optimizer=torch.optim.adam(actor.parameters(),lr=args.policy_lr)
+        qf1_optimizer=torch.optim.Adam(qf1.parameters(),args.q_lr)
+        qf2_optimizer=torch.optim.Adam(qf2.parameters(),lr=args.q_lr)
+        actor_optimizer=torch.optim.Adam(actor.parameters(),lr=args.policy_lr)
 
         if args.autotune:
-            target_entropy=args.target_entropy_scale * torch.log(envs.single_action_space.n)
-            log_alpha=torch.zeros(1,device=device)
+            target_entropy=args.target_entropy_scale * torch.log(torch.as_tensor(envs.single_action_space.n,device=device))
+            log_alpha=torch.zeros(1,device=device,requires_grad=True)
             alpha=torch.exp(log_alpha)
             alpha_optimizer=torch.optim.Adam([log_alpha],lr=args.q_lr)
         else:
             alpha=args.alpha
         rb=ReplayBuffer(
-            args.buffer_size,
+            int(args.buffer_size),
             envs.single_observation_space,
             envs.single_action_space,
             device,
+            n_envs=args.num_envs,
             handle_timeout_termination=False
 
         )
 
         start_time=time.time()
-        obs,_=envs.reset(args.seed)
+        obs,_=envs.reset(seed=args.seed)
 
         for i in range(args.total_time_step):
             if i < args.learning_start:
@@ -232,8 +233,8 @@ if __name__ == "__main__":
             next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
             if "final_info" in infos:
-                for info in infos["final_infos"]:
-                    if "episode" not in info:
+                for info in infos["final_info"]:
+                    if (info is None) or ("episode" not in info):
                         continue
                     print(f"final_steps={i},episode_return={info['episode']['r']}")
                     writer.add_scalar("charts/episode_return",info['episode']['r'],global_step=i)
@@ -275,7 +276,7 @@ if __name__ == "__main__":
                         qf2_q=qf2(data.observations)
                         qf_q_min=torch.min(qf1_q,qf2_q)
 
-                    loss_p=-(torch.mean((qf_q_min-alpha*logp_obs)*action_p_obs))
+                    loss_p=-(torch.mean((qf_q_min-alpha.detach()*logp_obs)*action_p_obs))
                     actor_optimizer.zero_grad()
                     loss_p.backward()
                     actor_optimizer.step()
@@ -292,7 +293,7 @@ if __name__ == "__main__":
                     if i % args.target_update_frequency==0:
                         with torch.no_grad():
 
-                            for param,target_param in zip(qf1.parameters(),qf2.parameters()):
+                            for param,target_param in zip(qf1.parameters(),qf1_target.parameters()):
                                 target_param.copy_(args.tau*param.data+(1-args.tau)*target_param.data)
                             for param,target_param in zip(qf2.parameters(),qf2_target.parameters()):
                                 target_param.copy_(args.tau*param.data+(1-args.tau)*target_param.data)
